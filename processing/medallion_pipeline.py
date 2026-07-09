@@ -549,3 +549,440 @@ print(f"→ {len(df_gold_anomalies)} anomalies identified")
 
 # COMMAND ----------
 
+# Cell 6: Phase 4 — Anomaly Detection with Isolation Forest
+#
+# Concept: We read our Silver Delta table (which has cleaned,
+# enriched trace data) and train a machine learning model to
+# learn what "normal" LLM call behaviour looks like.
+# Any call that doesn't fit the normal pattern gets flagged.
+
+import subprocess
+subprocess.run(["pip", "install", "scikit-learn", "mlflow", "matplotlib"],
+               capture_output=True)
+
+import boto3
+import pandas as pd
+import numpy as np
+import io
+import json
+from datetime import datetime, timezone
+from deltalake import DeltaTable
+
+# ── Credentials ──────────────────────────────────────────────
+AWS_ACCESS_KEY = "paste_your_access_key_id_here"
+AWS_SECRET_KEY = "paste_your_secret_access_key_here"
+AWS_REGION     = "ap-south-1"
+S3_BUCKET      = "paste_your_actual_bucket_name_here"
+
+storage_options = {
+    "AWS_ACCESS_KEY_ID":          AWS_ACCESS_KEY,
+    "AWS_SECRET_ACCESS_KEY":      AWS_SECRET_KEY,
+    "AWS_REGION":                 AWS_REGION,
+    "AWS_S3_ALLOW_UNSAFE_RENAME": "true",
+}
+
+# ── Load Silver table ─────────────────────────────────────────
+silver_path = f"s3://{S3_BUCKET}/silver/llm_traces"
+print("Loading Silver Delta table...")
+
+dt_silver = DeltaTable(silver_path, storage_options=storage_options)
+df = dt_silver.to_pandas()
+
+print(f"Loaded {len(df)} rows")
+print(f"Columns available: {list(df.columns)}")
+print(f"\nSample of key columns:")
+print(df[["model","latency_ms","cost_usd","total_tokens",
+          "is_anomaly_rule"]].head(5).to_string())
+
+
+# Cell 7: Feature engineering + train Isolation Forest
+#
+# Concept — Feature engineering:
+# We choose WHICH columns to give the model.
+# Good features are ones that actually describe LLM call behaviour.
+# Bad features are random IDs, text strings, or columns that leak
+# the answer (like is_anomaly_rule which we already computed).
+#
+# Concept — Isolation Forest:
+# contamination=0.05 means "I expect roughly 5% of my data to be
+# anomalous." Our producer injects 1 anomaly per 20 messages (5%)
+# so this is accurate. The model uses this to calibrate its threshold.
+
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+# ── Step 1: Select features ───────────────────────────────────
+# These 6 columns describe the "shape" of an LLM call.
+# The model learns the normal shape and flags deviations.
+FEATURES = [
+    "latency_ms",      # how long the call took
+    "cost_usd",        # how much it cost
+    "total_tokens",    # total tokens consumed
+    "prompt_tokens",   # how long the prompt was
+    "token_ratio",     # prompt/total ratio (long prompts = high cost)
+    "cost_per_token",  # efficiency metric
+]
+
+X = df[FEATURES].copy()
+
+# Handle any null values — fill with column median
+# Null values crash sklearn models, always handle them first
+X = X.fillna(X.median())
+
+print(f"Feature matrix shape: {X.shape}")
+print(f"\nFeature statistics:")
+print(X.describe().round(4).to_string())
+
+# ── Step 2: Standardize features ─────────────────────────────
+# Concept: StandardScaler converts each feature to have
+# mean=0 and standard deviation=1.
+# Why? latency_ms ranges from 200-20000. cost_usd ranges from
+# 0.0001 to 0.5. Without scaling, the model pays too much
+# attention to latency_ms just because its numbers are bigger.
+# Scaling puts all features on equal footing.
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+print(f"\nAfter scaling (first 3 rows):")
+print(pd.DataFrame(X_scaled, columns=FEATURES).head(3).round(4).to_string())
+
+# ── Step 3: Train Isolation Forest ───────────────────────────
+print("\nTraining Isolation Forest...")
+
+model = IsolationForest(
+    n_estimators=100,    # number of trees in the forest
+                         # more trees = more stable results
+                         # 100 is the standard starting point
+
+    contamination=0.05,  # expected fraction of anomalies
+                         # we inject 1 per 20 = 5% so this is accurate
+                         # the model uses this to set its internal threshold
+
+    random_state=42,     # makes results reproducible
+                         # same number = same model every time you train
+                         # important for comparing experiments
+
+    max_samples="auto",  # how many samples to use per tree
+                         # auto = min(256, n_samples)
+)
+
+model.fit(X_scaled)
+print("Model trained successfully!")
+
+# ── Step 4: Generate predictions ─────────────────────────────
+# predict() returns: +1 = normal, -1 = anomaly
+# decision_function() returns the raw anomaly score
+# More negative score = more anomalous
+
+predictions = model.predict(X_scaled)
+anomaly_scores = model.decision_function(X_scaled)
+
+# Convert to our convention: True = anomaly, False = normal
+df["is_anomaly_ml"] = predictions == -1
+df["anomaly_score"] = anomaly_scores.round(4)
+
+# Add severity based on score
+def get_severity(score):
+    if score < -0.15:   return "CRITICAL"
+    elif score < -0.10: return "HIGH"
+    elif score < -0.05: return "MEDIUM"
+    else:               return "NORMAL"
+
+df["ml_severity"] = df["anomaly_score"].apply(get_severity)
+
+# ── Step 5: Compare rule-based vs ML detection ───────────────
+print("\n=== RESULTS ===")
+print(f"\nRule-based anomalies (latency>5s OR cost>$0.10): "
+      f"{df['is_anomaly_rule'].sum()}")
+print(f"ML-based anomalies (Isolation Forest):           "
+      f"{df['is_anomaly_ml'].sum()}")
+
+print("\nML Severity breakdown:")
+print(df["ml_severity"].value_counts().to_string())
+
+# Show cases where ML and rules AGREE
+both = df[df["is_anomaly_rule"] & df["is_anomaly_ml"]]
+print(f"\nCases where BOTH methods agree: {len(both)}")
+
+# Show cases where ML catches something rules MISSED
+ml_only = df[df["is_anomaly_ml"] & ~df["is_anomaly_rule"]]
+print(f"Cases ML caught that rules MISSED: {len(ml_only)}")
+if len(ml_only) > 0:
+    print("These are subtle anomalies rules can't detect:")
+    print(ml_only[["model","latency_ms","cost_usd",
+                   "anomaly_score","ml_severity"]].to_string())
+
+# Show cases where rules fired but ML said NORMAL
+rules_only = df[df["is_anomaly_rule"] & ~df["is_anomaly_ml"]]
+print(f"Cases rules caught that ML said were normal: {len(rules_only)}")
+
+
+# Cell 8: Log experiment to MLflow — fully self-contained
+# Re-declares everything it needs so it works independently
+
+import subprocess
+subprocess.run(["pip", "install", "scikit-learn", "mlflow"], capture_output=True)
+
+import mlflow
+import mlflow.sklearn
+import boto3
+import pandas as pd
+import numpy as np
+import io
+from deltalake import DeltaTable
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+# ── Credentials ──────────────────────────────────────────────
+# ── Credentials ──────────────────────────────────────────────
+AWS_ACCESS_KEY = "paste_your_access_key_id_here"
+AWS_SECRET_KEY = "paste_your_secret_access_key_here"
+AWS_REGION     = "ap-south-1"
+S3_BUCKET      = "paste_your_actual_bucket_name_here"
+
+storage_options = {
+    "AWS_ACCESS_KEY_ID":          AWS_ACCESS_KEY,
+    "AWS_SECRET_ACCESS_KEY":      AWS_SECRET_KEY,
+    "AWS_REGION":                 AWS_REGION,
+    "AWS_S3_ALLOW_UNSAFE_RENAME": "true",
+}
+
+# ── Re-declare features ───────────────────────────────────────
+FEATURES = [
+    "latency_ms",
+    "cost_usd",
+    "total_tokens",
+    "prompt_tokens",
+    "token_ratio",
+    "cost_per_token",
+]
+
+# ── Re-load Silver data ───────────────────────────────────────
+silver_path = f"s3://{S3_BUCKET}/silver/llm_traces"
+print("Loading Silver Delta table...")
+dt_silver = DeltaTable(silver_path, storage_options=storage_options)
+df = dt_silver.to_pandas()
+print(f"Loaded {len(df)} rows")
+
+# ── Re-run feature engineering + training ────────────────────
+X = df[FEATURES].copy()
+X = X.fillna(X.median())
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+model = IsolationForest(
+    n_estimators=100,
+    contamination=0.05,
+    random_state=42,
+)
+model.fit(X_scaled)
+
+predictions    = model.predict(X_scaled)
+anomaly_scores = model.decision_function(X_scaled)
+
+df["is_anomaly_ml"] = predictions == -1
+df["anomaly_score"]  = anomaly_scores.round(4)
+
+def get_severity(score):
+    if score < -0.15:   return "CRITICAL"
+    elif score < -0.10: return "HIGH"
+    elif score < -0.05: return "MEDIUM"
+    else:               return "NORMAL"
+
+df["ml_severity"] = df["anomaly_score"].apply(get_severity)
+
+# ── MLflow logging ────────────────────────────────────────────
+EXPERIMENT_NAME = "/Users/ameysagare190@gmail.com/llm-anomaly-detection"
+mlflow.set_experiment(EXPERIMENT_NAME)
+
+total_anomalies = int(df["is_anomaly_ml"].sum())
+anomaly_rate    = round(total_anomalies / len(df) * 100, 2)
+critical_count  = int((df["ml_severity"] == "CRITICAL").sum())
+high_count      = int((df["ml_severity"] == "HIGH").sum())
+
+with mlflow.start_run(run_name="isolation-forest-v1"):
+
+    mlflow.log_param("model_type",    "IsolationForest")
+    mlflow.log_param("n_estimators",  100)
+    mlflow.log_param("contamination", 0.05)
+    mlflow.log_param("random_state",  42)
+    mlflow.log_param("n_features",    len(FEATURES))
+    mlflow.log_param("features",      str(FEATURES))
+    mlflow.log_param("training_rows", len(df))
+
+    mlflow.log_metric("total_anomalies",  total_anomalies)
+    mlflow.log_metric("anomaly_rate_pct", anomaly_rate)
+    mlflow.log_metric("critical_count",   critical_count)
+    mlflow.log_metric("high_count",       high_count)
+    mlflow.log_metric("training_rows",    len(df))
+
+    # input_example shows MLflow what the input data looks like
+    # MLflow uses this to auto-generate the signature
+    # signature = the contract: "this model expects these columns
+    # with these data types and returns these outputs"
+    input_example = pd.DataFrame(X_scaled[:5], columns=FEATURES)
+
+    mlflow.sklearn.log_model(
+        model,
+        "isolation_forest",
+        registered_model_name="LLMAnomalyDetector",
+        input_example=input_example,
+    )
+    
+    
+    mlflow.sklearn.log_model(scaler, "feature_scaler")
+    mlflow.log_dict({"features": FEATURES}, "features.json")
+
+    run_id = mlflow.active_run().info.run_id
+    print(f"\nMLflow run logged successfully")
+    print(f"Run ID: {run_id}")
+    print(f"\nParameters logged:")
+    print(f"  n_estimators:  100")
+    print(f"  contamination: 0.05")
+    print(f"  features:      {FEATURES}")
+    print(f"\nMetrics logged:")
+    print(f"  total_anomalies:  {total_anomalies}")
+    print(f"  anomaly_rate_pct: {anomaly_rate}%")
+    print(f"  critical_count:   {critical_count}")
+    print(f"  high_count:       {high_count}")
+    print(f"\nModel registered as: LLMAnomalyDetector")
+    print(f"View: left sidebar → Experiments → llm-anomaly-detection")
+
+
+# Cell 9: Save ML predictions to Gold Delta table
+# Fully self-contained — re-runs everything needed
+
+import subprocess
+subprocess.run(["pip", "install", "scikit-learn", "deltalake"], capture_output=True)
+
+import boto3
+import pandas as pd
+import numpy as np
+import io
+from deltalake import DeltaTable
+from deltalake.writer import write_deltalake
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+# ── Credentials ──────────────────────────────────────────────
+# ── Credentials ──────────────────────────────────────────────
+AWS_ACCESS_KEY = "paste_your_access_key_id_here"
+AWS_SECRET_KEY = "paste_your_secret_access_key_here"
+AWS_REGION     = "ap-south-1"
+S3_BUCKET      = "paste_your_actual_bucket_name_here"
+
+storage_options = {
+    "AWS_ACCESS_KEY_ID":          AWS_ACCESS_KEY,
+    "AWS_SECRET_ACCESS_KEY":      AWS_SECRET_KEY,
+    "AWS_REGION":                 AWS_REGION,
+    "AWS_S3_ALLOW_UNSAFE_RENAME": "true",
+}
+
+FEATURES = [
+    "latency_ms", "cost_usd", "total_tokens",
+    "prompt_tokens", "token_ratio", "cost_per_token",
+]
+
+# ── Re-load Silver ────────────────────────────────────────────
+silver_path = f"s3://{S3_BUCKET}/silver/llm_traces"
+print("Loading Silver Delta table...")
+dt_silver = DeltaTable(silver_path, storage_options=storage_options)
+df = dt_silver.to_pandas()
+print(f"Loaded {len(df)} rows")
+
+# ── Re-run training ───────────────────────────────────────────
+X = df[FEATURES].copy().fillna(df[FEATURES].median())
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+model = IsolationForest(
+    n_estimators=100,
+    contamination=0.05,
+    random_state=42,
+)
+model.fit(X_scaled)
+
+predictions    = model.predict(X_scaled)
+anomaly_scores = model.decision_function(X_scaled)
+
+df["is_anomaly_ml"] = predictions == -1
+df["anomaly_score"]  = anomaly_scores.round(4)
+
+def get_severity(score):
+    if score < -0.15:   return "CRITICAL"
+    elif score < -0.10: return "HIGH"
+    elif score < -0.05: return "MEDIUM"
+    else:               return "NORMAL"
+
+df["ml_severity"] = df["anomaly_score"].apply(get_severity)
+
+# ── Build Gold ML table ───────────────────────────────────────
+print("\nBuilding Gold ML anomaly scores table...")
+
+df_gold_ml = df[[
+    "trace_id",
+    "model",
+    "app_name",
+    "session_id",
+    "latency_ms",
+    "cost_usd",
+    "total_tokens",
+    "prompt_tokens",
+    "token_ratio",
+    "cost_per_token",
+    "is_error",
+    "model_family",
+    "latency_bucket",
+    "is_anomaly_rule",
+    "is_anomaly_ml",
+    "anomaly_score",
+    "ml_severity",
+    "event_date",
+    "event_hour",
+]].copy()
+
+# Convert any non-string timestamp columns to string for Delta compatibility
+df_gold_ml["event_date"] = df_gold_ml["event_date"].astype(str)
+
+# ── Write to S3 as Delta table ────────────────────────────────
+gold_ml_path = f"s3://{S3_BUCKET}/gold/ml_anomaly_scores"
+print(f"Writing to: {gold_ml_path}")
+
+write_deltalake(
+    gold_ml_path,
+    df_gold_ml,
+    mode="overwrite",
+    storage_options=storage_options,
+)
+
+print("Gold ML table written successfully!")
+
+# ── Verify ────────────────────────────────────────────────────
+dt_check = DeltaTable(gold_ml_path, storage_options=storage_options)
+df_check = dt_check.to_pandas()
+
+print(f"\nVerification: {len(df_check)} rows confirmed")
+print(f"Columns: {len(df_check.columns)}")
+
+print("\nSeverity breakdown:")
+print(df_check["ml_severity"].value_counts().to_string())
+
+print("\nRule-based vs ML comparison:")
+print(f"  Rule-based anomalies: {df_check['is_anomaly_rule'].sum()}")
+print(f"  ML anomalies:         {df_check['is_anomaly_ml'].sum()}")
+
+print("\nTop 5 most anomalous calls (lowest score = most suspicious):")
+top5 = df_check.nsmallest(5, "anomaly_score")
+print(top5[[
+    "model", "latency_ms", "cost_usd",
+    "anomaly_score", "ml_severity"
+]].to_string())
+
+print("\n" + "="*50)
+print("PHASE 4 COMPLETE")
+print("="*50)
+print(f"Gold ML table: {gold_ml_path}")
+print(f"Total traces scored: {len(df_check)}")
+print(f"Anomalies detected: {df_check['is_anomaly_ml'].sum()}")
+print(f"Anomaly rate: {df_check['is_anomaly_ml'].mean()*100:.1f}%")
