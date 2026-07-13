@@ -1,8 +1,30 @@
+# Core
 python-dotenv==1.0.0
 requests==2.31.0
 
+# Kafka
 confluent-kafka==2.14.2
 
+# AWS + Storage
 boto3==1.43.37
 pyarrow==24.0.0
 pandas==3.0.3
+
+# Delta Lake
+deltalake==0.25.4
+
+# ML
+scikit-learn==1.6.1
+mlflow==3.1.1
+
+# Embeddings + Vector DB
+sentence-transformers==5.6.0
+pinecone==9.1.0
+
+# LLM
+groq==0.37.1
+
+# API + Dashboard (Phase 6)
+fastapi==0.115.0
+uvicorn==0.34.0
+streamlit==1.45.0
